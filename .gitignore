@@ -1,0 +1,9 @@
+bin/
+obj/
+publish/
+*.db
+*.user
+.vs/
+.env
+appsettings.*.local.json
+*.tar.gz
