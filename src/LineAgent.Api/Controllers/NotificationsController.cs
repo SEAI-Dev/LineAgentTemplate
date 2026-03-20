@@ -22,7 +22,7 @@ public class NotificationsController : ControllerBase
     public async Task<IActionResult> SendTest()
     {
         var ok = await _lineService.SendTestMessageAsync();
-        return ok ? Ok(new { message = "Test sent" }) : BadRequest(new { message = "Failed. Check LINE config." });
+        return ok ? Ok(new { message = "Test sent" }) : BadRequest(new { message = "No registered users or LINE config missing." });
     }
 
     [HttpPost("trigger/daily")]
@@ -30,6 +30,19 @@ public class NotificationsController : ControllerBase
     {
         await _lineService.SendDailyReminderAsync();
         return Ok(new { message = "Daily reminder triggered" });
+    }
+
+    /// <summary>
+    /// Broadcast a message to all registered users, optionally filtered by channel.
+    /// </summary>
+    [HttpPost("broadcast")]
+    public async Task<IActionResult> Broadcast([FromBody] BroadcastRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.Text))
+            return BadRequest(new { error = "Text is required" });
+
+        var (sent, failed) = await _lineService.BroadcastAsync(request.Text, request.ChannelId);
+        return Ok(new { sent, failed, total = sent + failed });
     }
 
     [HttpGet("logs")]
@@ -40,4 +53,10 @@ public class NotificationsController : ControllerBase
             "SELECT * FROM NotificationLogs ORDER BY SentAt DESC LIMIT @Limit", new { Limit = limit });
         return Ok(logs);
     }
+}
+
+public class BroadcastRequest
+{
+    public string Text { get; set; } = string.Empty;
+    public int? ChannelId { get; set; }
 }

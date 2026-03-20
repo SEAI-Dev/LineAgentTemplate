@@ -7,10 +7,17 @@ namespace LineAgent.Api.Services;
 
 public interface ILineMessagingService
 {
+    // Multi-channel methods (use channel's access token)
+    Task<bool> PushTextMessageAsync(string accessToken, string userId, string text);
+    Task<bool> ReplyTextMessageAsync(string accessToken, string replyToken, string text);
+
+    // Legacy single-channel methods (use default config token, for backward compat)
     Task<bool> PushTextMessageAsync(string userId, string text);
     Task<bool> ReplyTextMessageAsync(string replyToken, string text);
+
     Task SendDailyReminderAsync();
     Task<bool> SendTestMessageAsync();
+    Task<(int Sent, int Failed)> BroadcastAsync(string text, int? channelId = null);
     string GetChannelAccessToken();
 }
 
@@ -19,7 +26,7 @@ public class LineMessagingService : ILineMessagingService
     private const string PushUrl = "https://api.line.me/v2/bot/message/push";
     private const string ReplyUrl = "https://api.line.me/v2/bot/message/reply";
     private readonly HttpClient _httpClient;
-    private readonly string _channelAccessToken;
+    private readonly string _defaultAccessToken;
     private readonly IDbConnectionFactory _dbFactory;
     private readonly IItemService _itemService;
     private readonly ILogger<LineMessagingService> _logger;
@@ -32,29 +39,41 @@ public class LineMessagingService : ILineMessagingService
         ILogger<LineMessagingService> logger)
     {
         _httpClient = httpClientFactory.CreateClient("LINE");
-        _channelAccessToken = config["Line:ChannelAccessToken"]
+        _defaultAccessToken = config["Line:ChannelAccessToken"]
             ?? Environment.GetEnvironmentVariable("LINE_CHANNEL_ACCESS_TOKEN")
-            ?? throw new InvalidOperationException("LINE Channel Access Token not configured");
+            ?? ""; // No longer throw — multi-channel mode may not have a default token
         _dbFactory = dbFactory;
         _itemService = itemService;
         _logger = logger;
     }
 
-    public string GetChannelAccessToken() => _channelAccessToken;
+    public string GetChannelAccessToken() => _defaultAccessToken;
 
-    public async Task<bool> ReplyTextMessageAsync(string replyToken, string text)
+    // ===== Multi-channel =====
+
+    public Task<bool> ReplyTextMessageAsync(string accessToken, string replyToken, string text)
     {
         var payload = new { replyToken, messages = new[] { new { type = "text", text } } };
-        return await SendAsync(ReplyUrl, payload, "Reply");
+        return SendAsync(ReplyUrl, payload, "Reply", accessToken);
     }
 
-    public async Task<bool> PushTextMessageAsync(string userId, string text)
+    public Task<bool> PushTextMessageAsync(string accessToken, string userId, string text)
     {
         var payload = new { to = userId, messages = new[] { new { type = "text", text } } };
-        return await SendAsync(PushUrl, payload, "Push", userId);
+        return SendAsync(PushUrl, payload, "Push", accessToken, userId);
     }
 
-    private async Task<bool> SendAsync(string url, object payload, string type, string? userId = null)
+    // ===== Legacy single-channel (backward compat) =====
+
+    public Task<bool> ReplyTextMessageAsync(string replyToken, string text)
+        => ReplyTextMessageAsync(_defaultAccessToken, replyToken, text);
+
+    public Task<bool> PushTextMessageAsync(string userId, string text)
+        => PushTextMessageAsync(_defaultAccessToken, userId, text);
+
+    // ===== Internal =====
+
+    private async Task<bool> SendAsync(string url, object payload, string type, string accessToken, string? userId = null)
     {
         try
         {
@@ -63,7 +82,7 @@ public class LineMessagingService : ILineMessagingService
             {
                 Content = new StringContent(json, Encoding.UTF8, "application/json")
             };
-            request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", _channelAccessToken);
+            request.Headers.Authorization = new System.Net.Http.Headers.AuthenticationHeaderValue("Bearer", accessToken);
 
             var response = await _httpClient.SendAsync(request);
             var success = response.IsSuccessStatusCode;
@@ -95,12 +114,47 @@ public class LineMessagingService : ILineMessagingService
         catch { }
     }
 
-    private async Task<List<LineUser>> GetActiveUsersAsync(string notifyType)
+    // ==================== Multi-channel Push Helpers ====================
+
+    /// <summary>
+    /// Get all registered users grouped by channel (for multi-channel push).
+    /// Returns (LineUserId, ChannelAccessToken) pairs.
+    /// </summary>
+    private async Task<List<(string LineUserId, string AccessToken)>> GetRegisteredRecipientsAsync(int? channelId = null)
     {
         using var db = _dbFactory.CreateConnection();
-        return (await db.QueryAsync<LineUser>(
-            "SELECT * FROM LineUsers WHERE IsActive = 1 AND NotifyTypes LIKE @Pattern",
-            new { Pattern = $"%{notifyType}%" })).ToList();
+        var sql = """
+            SELECT r.LineUserId, c.ChannelAccessToken
+            FROM LineRegistrations r
+            INNER JOIN LineChannels c ON c.Id = r.ChannelId AND c.IsActive = 1
+            WHERE r.IsActive = 1
+            """;
+
+        if (channelId.HasValue)
+            sql += " AND r.ChannelId = @ChannelId";
+
+        var rows = await db.QueryAsync<(string LineUserId, string AccessToken)>(sql,
+            channelId.HasValue ? new { ChannelId = channelId.Value } : null);
+        return rows.ToList();
+    }
+
+    /// <summary>
+    /// Push a text message to all registered users (or filtered by channel).
+    /// Returns (sent, failed) counts.
+    /// </summary>
+    public async Task<(int Sent, int Failed)> BroadcastAsync(string text, int? channelId = null)
+    {
+        var recipients = await GetRegisteredRecipientsAsync(channelId);
+        int sent = 0, failed = 0;
+
+        foreach (var (lineUserId, accessToken) in recipients)
+        {
+            var ok = await PushTextMessageAsync(accessToken, lineUserId, text);
+            if (ok) sent++; else failed++;
+        }
+
+        _logger.LogInformation("Broadcast: {Sent} sent, {Failed} failed (channel={ChannelId})", sent, failed, channelId?.ToString() ?? "all");
+        return (sent, failed);
     }
 
     // ==================== Scheduled Notifications (Push = costs quota) ====================
@@ -108,7 +162,6 @@ public class LineMessagingService : ILineMessagingService
     public async Task SendDailyReminderAsync()
     {
         var summary = await _itemService.GetDailySummaryAsync();
-        var users = await GetActiveUsersAsync("Daily");
         var date = summary.Date.ToString("M/d (ddd)");
 
         var lines = new List<string> { $"📋 {date} Daily Reminder", "━━━━━━━━━━━━━━━" };
@@ -130,17 +183,39 @@ public class LineMessagingService : ILineMessagingService
         lines.Add($"Due: {summary.TotalPending} | InProgress: {summary.InProgress} | Overdue: {summary.Overdue}");
 
         var text = string.Join("\n", lines);
-        foreach (var user in users)
-            await PushTextMessageAsync(user.LineUserId, text);
+        var (sent, _) = await BroadcastAsync(text);
 
-        _logger.LogInformation("Daily reminder sent to {Count} users", users.Count);
+        // Fallback: also send to legacy LineUsers if any
+        if (sent == 0)
+        {
+            using var db = _dbFactory.CreateConnection();
+            var legacyUsers = (await db.QueryAsync<LineUser>(
+                "SELECT * FROM LineUsers WHERE IsActive = 1 AND NotifyTypes LIKE '%Daily%'")).ToList();
+            foreach (var user in legacyUsers)
+                await PushTextMessageAsync(user.LineUserId, text);
+            if (legacyUsers.Any())
+                _logger.LogInformation("Daily reminder fallback to legacy LineUsers: {Count}", legacyUsers.Count);
+        }
     }
 
     public async Task<bool> SendTestMessageAsync()
     {
-        var users = await GetActiveUsersAsync("Daily");
-        if (!users.Any()) return false;
-        return await PushTextMessageAsync(users.First().LineUserId,
-            $"🤖 LINE Agent Test\n\nConnection OK! Time: {DateTime.Now:yyyy-MM-dd HH:mm:ss}");
+        var testMsg = $"🤖 LINE Agent Test\n\nConnection OK!\nTime: {DateTime.Now:yyyy-MM-dd HH:mm:ss}";
+
+        // Try registered users first
+        var recipients = await GetRegisteredRecipientsAsync();
+        if (recipients.Any())
+        {
+            var (lineUserId, accessToken) = recipients.First();
+            return await PushTextMessageAsync(accessToken, lineUserId, testMsg);
+        }
+
+        // Fallback to legacy
+        using var db = _dbFactory.CreateConnection();
+        var legacyUser = await db.QueryFirstOrDefaultAsync<LineUser>("SELECT * FROM LineUsers WHERE IsActive = 1 LIMIT 1");
+        if (legacyUser != null)
+            return await PushTextMessageAsync(legacyUser.LineUserId, testMsg);
+
+        return false;
     }
 }

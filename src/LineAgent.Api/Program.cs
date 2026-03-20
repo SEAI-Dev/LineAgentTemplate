@@ -9,10 +9,14 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddControllers();
 builder.Services.AddOpenApi();
 builder.Services.AddHttpClient("LINE");
+builder.Services.AddHttpClient("SEOS");
 
 builder.Services.AddSingleton<IDbConnectionFactory, DbConnectionFactory>();
 builder.Services.AddSingleton<IItemService, ItemService>();
 builder.Services.AddSingleton<ILineMessagingService, LineMessagingService>();
+builder.Services.AddSingleton<IChannelService, ChannelService>();
+builder.Services.AddSingleton<IRegistrationService, RegistrationService>();
+builder.Services.AddSingleton<IEmployeeSyncService, EmployeeSyncService>();
 builder.Services.AddTransient<NotificationJobs>();
 
 // Hangfire
@@ -76,10 +80,49 @@ if (useSqlite)
             ErrorMessage TEXT,
             SentAt TEXT NOT NULL DEFAULT (datetime('now','localtime'))
         );
+        CREATE TABLE IF NOT EXISTS LineChannels (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ChannelName TEXT NOT NULL,
+            ChannelId TEXT NOT NULL,
+            ChannelSecret TEXT NOT NULL,
+            ChannelAccessToken TEXT NOT NULL,
+            WebhookPath TEXT NOT NULL UNIQUE,
+            BranchNo TEXT,
+            IsActive INTEGER NOT NULL DEFAULT 1,
+            CreatedAt TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            UpdatedAt TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+        );
+        CREATE TABLE IF NOT EXISTS Employees (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            UserId TEXT NOT NULL UNIQUE,
+            FullNameInChinese TEXT NOT NULL DEFAULT '',
+            Mobile TEXT,
+            PasswordHash TEXT,
+            AssignBranchNo TEXT,
+            JobTitle TEXT,
+            DepartmentId INTEGER,
+            DepartmentName TEXT,
+            IsAlive INTEGER NOT NULL DEFAULT 1,
+            LastSyncAt TEXT,
+            CreatedAt TEXT NOT NULL DEFAULT (datetime('now','localtime'))
+        );
+        CREATE TABLE IF NOT EXISTS LineRegistrations (
+            Id INTEGER PRIMARY KEY AUTOINCREMENT,
+            LineUserId TEXT NOT NULL,
+            EmployeeUserId TEXT NOT NULL,
+            ChannelId INTEGER NOT NULL,
+            DisplayName TEXT,
+            IsActive INTEGER NOT NULL DEFAULT 1,
+            RegisteredAt TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+            LastInteractionAt TEXT
+        );
+        CREATE INDEX IF NOT EXISTS IX_Employees_Mobile ON Employees(Mobile);
+        CREATE INDEX IF NOT EXISTS IX_LineRegistrations_LineUserId ON LineRegistrations(LineUserId, ChannelId);
+        CREATE INDEX IF NOT EXISTS IX_LineChannels_WebhookPath ON LineChannels(WebhookPath);
         """;
     cmd.ExecuteNonQuery();
 
-    // Seed default user from env
+    // Seed default user from env (legacy)
     var defaultUserId = Environment.GetEnvironmentVariable("LINE_DEFAULT_USER_ID")
         ?? app.Configuration["Line:DefaultUserId"];
     if (!string.IsNullOrEmpty(defaultUserId))
@@ -105,8 +148,5 @@ var tz = TimeZoneInfo.GetSystemTimeZones()
 RecurringJob.AddOrUpdate<NotificationJobs>(
     "daily-reminder", j => j.DailyReminderAsync(), "0 9 * * 1-5",
     new RecurringJobOptions { TimeZone = tz });
-
-// Add more recurring jobs:
-// RecurringJob.AddOrUpdate<NotificationJobs>("weekly-review", j => j.WeeklyReviewAsync(), "0 17 * * 5", new RecurringJobOptions { TimeZone = tz });
 
 app.Run();
